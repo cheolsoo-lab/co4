@@ -1,5 +1,5 @@
 """
-app.py — 심신안정 웹 화면 (핸드폰 우선)
+app.py — 코인 추천 웹 화면 (핸드폰 우선)
 실행:  streamlit run app.py
 배포:  README.md 참고 (Streamlit Community Cloud 또는 본인 PC/서버)
 
@@ -16,7 +16,7 @@ import streamlit as st
 import app_logic as L
 import crypto_market_regime as cmr
 
-st.set_page_config(page_title="심신안정", page_icon="📈", layout="centered",
+st.set_page_config(page_title="코인 추천", page_icon="📈", layout="centered",
                    initial_sidebar_state="collapsed")
 st.markdown(f"<style>{L.CSS}</style>", unsafe_allow_html=True)
 
@@ -29,7 +29,7 @@ def get_store() -> dict:
 
 store = get_store()
 
-st.title("📈 심신안정")
+st.title("📈 코인 추천")
 st.caption("Bitget 선물용 · 4시간봉 스윙 신호 · 참고용(자동 주문 아님)")
 
 # ---------------------------------------------------------------- 설정
@@ -101,6 +101,9 @@ if store["scan_cfg"] != scan_cfg:
 regime = res["regime"]
 macro_hours = regime.snapshot.get("macro_span_hours", 0.0)
 st.markdown(L.regime_html(regime, macro_hours), unsafe_allow_html=True)
+if "btc_d" not in regime.snapshot:
+    st.caption("ⓘ 이번엔 CoinGecko 응답이 지연/제한(429)되어 BTC.D 등 최신값을 못 받았어요. "
+               "BTC 가격 추세로는 정상 판단했고, 다음 갱신 때 다시 시도합니다.")
 with st.expander("📊 판단 근거 자세히"):
     st.markdown(L.regime_detail_html(regime), unsafe_allow_html=True)
     st.caption(regime.explanation)

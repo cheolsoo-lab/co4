@@ -49,6 +49,8 @@ HISTORY_FILE = "market_regime_history.csv"        # BTC.D / USDT.D / TOTAL2,3 �
 REGIME_LOG_FILE = "regime_confirmation_log.csv"   # 국면 whipsaw 방지용 확정 이력
 
 CoinGeckoGlobalURL = "https://api.coingecko.com/api/v3/global"
+CoinPaprikaGlobalURL = "https://api.coinpaprika.com/v1/global"
+CoinPaprikaTickerURL = "https://api.coinpaprika.com/v1/tickers/{coin_id}"
 
 RegimeType = Literal["uptrend", "downtrend", "sideways"]
 
@@ -109,33 +111,74 @@ def cap_correlated_exposure(setups: List["CoinSetup"], risk_cfg: RiskConfig,
 # 1. 거시 지표: BTC.D, USDT.D, TOTAL2, TOTAL3
 # --------------------------------------------------------------------------
 
-def fetch_global_snapshot() -> Dict:
-    """CoinGecko 글로벌 마켓캡 데이터에서 BTC.D, USDT.D, TOTAL2, TOTAL3를 계산.
-    (CoinGecko 무료 API는 '현재 스냅샷'만 제공하므로, 추세는 HISTORY_FILE에
-    스냅샷을 누적 저장해서 별도로 계산합니다. 이 스크립트를 주기적으로
-    cron 등으로 돌리면 시간이 지날수록 추세 판단 정확도가 올라갑니다.)
-    """
-    resp = requests.get(CoinGeckoGlobalURL, timeout=10)
-    resp.raise_for_status()
+def _fetch_snapshot_coingecko() -> Optional[Dict]:
+    """1차 공급처. 실패 시 None (예외를 던지지 않음 — 호출부가 다음 공급처로 넘어감)."""
+    try:
+        resp = requests.get(CoinGeckoGlobalURL, timeout=10)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        print(f"[warn] CoinGecko 조회 실패: {e}")
+        return None
     data = resp.json()["data"]
-
     total_mcap = data["total_market_cap"]["usd"]
     btc_pct = data["market_cap_percentage"].get("btc", 0)
     eth_pct = data["market_cap_percentage"].get("eth", 0)
     usdt_pct = data["market_cap_percentage"].get("usdt", 0)
-
-    total2 = total_mcap * (1 - btc_pct / 100)
-    total3 = total_mcap * (1 - btc_pct / 100 - eth_pct / 100)
-
-    snapshot = {
-        "timestamp": int(time.time()),
-        "total_mcap": total_mcap,
-        "btc_d": btc_pct,
-        "usdt_d": usdt_pct,
-        "eth_d": eth_pct,
-        "total2": total2,
-        "total3": total3,
+    return {
+        "total_mcap": total_mcap, "btc_d": btc_pct, "usdt_d": usdt_pct, "eth_d": eth_pct,
+        "total2": total_mcap * (1 - btc_pct / 100),
+        "total3": total_mcap * (1 - btc_pct / 100 - eth_pct / 100),
     }
+
+
+def _fetch_snapshot_coinpaprika() -> Optional[Dict]:
+    """2차 공급처(CoinGecko 실패 시). CoinGecko와 완전히 다른 회사·서버라 같은 이유로
+    동시에 막힐 가능성이 낮습니다. 월 2만 회 무료, API 키 불필요.
+    ⚠️ ETH/USDT 개별 시가총액을 구하려 티커를 2번 더 호출합니다(그래도 무료 한도에 넉넉히 여유)."""
+    try:
+        g = requests.get(CoinPaprikaGlobalURL, timeout=10)
+        g.raise_for_status()
+        gd = g.json()
+        total_mcap = gd["market_cap_usd"]
+        btc_pct = gd["bitcoin_dominance_percentage"]
+
+        eth = requests.get(CoinPaprikaTickerURL.format(coin_id="eth-ethereum"), timeout=10)
+        eth.raise_for_status()
+        eth_mcap = eth.json()["quotes"]["USD"]["market_cap"]
+
+        usdt = requests.get(CoinPaprikaTickerURL.format(coin_id="usdt-tether"), timeout=10)
+        usdt.raise_for_status()
+        usdt_mcap = usdt.json()["quotes"]["USD"]["market_cap"]
+    except (requests.exceptions.RequestException, KeyError) as e:
+        print(f"[warn] CoinPaprika 조회 실패: {e}")
+        return None
+
+    eth_pct = eth_mcap / total_mcap * 100
+    usdt_pct = usdt_mcap / total_mcap * 100
+    return {
+        "total_mcap": total_mcap, "btc_d": btc_pct, "usdt_d": usdt_pct, "eth_d": eth_pct,
+        "total2": total_mcap * (1 - btc_pct / 100),
+        "total3": total_mcap * (1 - btc_pct / 100 - eth_pct / 100),
+    }
+
+
+def fetch_global_snapshot() -> Optional[Dict]:
+    """BTC.D, USDT.D, TOTAL2, TOTAL3 스냅샷. CoinGecko를 1차로 시도하고, 실패하면(429 등)
+    완전히 별도 회사·서버인 CoinPaprika로 넘어갑니다 — 같은 원인으로 둘 다 막힐 가능성은 낮습니다.
+    둘 다 실패하면 None을 반환해서, 호출부(determine_overall_regime)가 이번 회차는
+    새 스냅샷 없이 기존에 쌓인 기록으로만 판단하도록 합니다.
+    (CoinGecko/CoinPaprika 무료 API는 '현재 스냅샷'만 주고 과거 시계열은 안 줘서, 추세는
+    HISTORY_FILE에 스냅샷을 직접 누적해서 계산합니다 — 이 스크립트를 자주 돌릴수록 정확해집니다.)
+    """
+    fields = _fetch_snapshot_coingecko()
+    source = "coingecko"
+    if fields is None:
+        fields = _fetch_snapshot_coinpaprika()
+        source = "coinpaprika"
+    if fields is None:
+        return None
+
+    snapshot = {"timestamp": int(time.time()), "source": source, **fields}
     _append_history(snapshot)
     return snapshot
 
@@ -402,6 +445,9 @@ def fmt_range(x: float) -> str:
 
 def determine_overall_regime() -> MarketRegime:
     snap = fetch_global_snapshot()
+    if snap is None:
+        print("[warn] 이번 회차는 새 거시 스냅샷 없이 기존 기록만으로 판단합니다 (BTC.D 등 값 갱신 안 됨)")
+        snap = {}
     btc_df = fetch_btc_df()
 
     btc_trend = classify_price_trend(btc_df)
