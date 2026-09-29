@@ -1,5 +1,5 @@
 """
-app.py — 코인 추천 웹 화면 (핸드폰 우선)
+app.py — 심신안정 웹 화면 (핸드폰 우선)
 실행:  streamlit run app.py
 배포:  README.md 참고 (Streamlit Community Cloud 또는 본인 PC/서버)
 
@@ -16,7 +16,7 @@ import streamlit as st
 import app_logic as L
 import crypto_market_regime as cmr
 
-st.set_page_config(page_title="코인 추천", page_icon="📈", layout="centered",
+st.set_page_config(page_title="심신안정", page_icon="📈", layout="centered",
                    initial_sidebar_state="collapsed")
 st.markdown(f"<style>{L.CSS}</style>", unsafe_allow_html=True)
 
