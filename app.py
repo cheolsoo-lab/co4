@@ -16,7 +16,7 @@ import streamlit as st
 import app_logic as L
 import crypto_market_regime as cmr
 
-st.set_page_config(page_title="코인 추천", page_icon="📈", layout="centered",
+st.set_page_config(page_title="심신안정", page_icon="📈", layout="centered",
                    initial_sidebar_state="collapsed")
 st.markdown(f"<style>{L.CSS}</style>", unsafe_allow_html=True)
 
@@ -29,7 +29,7 @@ def get_store() -> dict:
 
 store = get_store()
 
-st.title("📈 코인 추천")
+st.title("📈 심신안정")
 st.caption("Bitget 선물용 · 4시간봉 스윙 신호 · 참고용(자동 주문 아님)")
 
 # ---------------------------------------------------------------- 설정
