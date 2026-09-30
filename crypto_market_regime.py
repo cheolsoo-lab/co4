@@ -42,7 +42,7 @@ except ImportError:
 
 EXCHANGES = ["bitget", "okx", "binance"]          # 앞쪽일수록 우선 사용(Bitget = 실제 거래 거래소). 일부 거래소는 서버 지역에 따라 차단될 수 있음
 QUOTE = "USDT"
-TOP_N_BY_VOLUME = 30                              # 거래량 상위 N개 코인만 스크리닝
+TOP_N_BY_VOLUME = 100                             # 거래량 상위 N개 코인만 스크리닝
 TIMEFRAME = "4h"                                  # 스윙 트레이딩 기준 봉
 OHLCV_LIMIT = 200                                 # 캔들 개수
 HISTORY_FILE = "market_regime_history.csv"        # BTC.D / USDT.D / TOTAL2,3 스냅샷 누적 저장 (트렌드 판단용)
@@ -61,7 +61,7 @@ class RiskConfig:
     account_balance: float          # 계좌 총 잔고 (USDT 기준)
     risk_per_trade_pct: float = 1.0  # 트레이드 1건당 허용 손실 (계좌 대비 %). 권장 0.5~2%
     max_correlated_exposure_pct: float = 3.0  # BTC 방향에 동조된 포지션들의 합산 리스크 상한(%)
-    max_concurrent_setups: int = 3   # 같은 방향(롱 또는 숏) 동시 보유 최대 개수
+    max_concurrent_setups: int = 10  # 같은 방향(롱 또는 숏) 동시 보유 최대 개수
 
 
 def calculate_position_size(entry: float, sl: float, risk_cfg: RiskConfig) -> Dict:
@@ -541,6 +541,8 @@ class CoinSetup:
     rs: float = 0.0  # 지수(BTC) 대비 상대강도(%) — 클수록 시장 대비 강함
     asymmetry: Optional[float] = None  # 상승포착률-하락포착률 — 클수록 '오를 때 크게 빠질 때 작게'
     bitget_perp: Optional[bool] = None  # Bitget USDT 무기한 선물 거래 가능 여부(None=확인 불가)
+    counter_trend: bool = False  # True면 이 코인의 개별 국면이 시장 전체 국면과 반대 방향
+    sweep_confluence: bool = False  # True면 진입 자리에서 유동성 스윕(손절 사냥 후 반전)이 확인됨
 
 
 def get_top_volume_symbols(exchange_id: str, top_n: int = TOP_N_BY_VOLUME) -> List[str]:
@@ -799,6 +801,32 @@ def calculate_volume_profile(df: pd.DataFrame, num_bins: int = 50, lookback: int
     return {"poc": float(poc_price), "val": float(bins[lo]), "vah": float(bins[hi + 1])}
 
 
+def detect_liquidity_sweep(df: pd.DataFrame, lookback: int = 20) -> Dict:
+    """최근 완결봉이 직전 lookback봉의 스윙 고점/저점을 꼬리(wick)로 살짝 넘었다가
+    종가는 다시 그 안으로 들어온 '유동성 스윕(손절 사냥 후 반전)' 패턴 탐지.
+    - bullish_sweep: 직전 스윙 저점을 저가로 이탈했다가 종가는 그 위로 복귀 → 매수세 유입(반전 상승 신호)
+    - bearish_sweep: 직전 스윙 고점을 고가로 이탈했다가 종가는 그 아래로 복귀 → 매도세 유입(반전 하락 신호)
+    ⚠️ 4시간봉 기준입니다. 원래 이 컨셉은 1~15분봉처럼 훨씬 짧은 타임프레임에서 정밀 진입용으로
+    쓰이는 경우가 많아, 4시간봉에서는 일반적인 변동성과 뚜렷이 구분되지 않을 수 있습니다.
+    여기서는 '있으면 신뢰도를 살짝 높여주는 보조 컨플루언스'로만 쓰고, 진입 조건 자체를 바꾸지
+    않습니다 — 이렇게 해야 이 신호가 실제로 도움이 되는지 나중에 백테스트로 따로 검증할 수 있습니다."""
+    if len(df) < lookback + 2:
+        return {"bullish_sweep": None, "bearish_sweep": None}
+    recent = df.tail(lookback + 1)
+    prior, last = recent.iloc[:-1], recent.iloc[-1]
+    prior_low, prior_high = prior["low"].min(), prior["high"].max()
+
+    bullish_sweep = None
+    if last["low"] < prior_low and last["close"] > prior_low:
+        bullish_sweep = {"swept_level": float(prior_low), "close": float(last["close"])}
+
+    bearish_sweep = None
+    if last["high"] > prior_high and last["close"] < prior_high:
+        bearish_sweep = {"swept_level": float(prior_high), "close": float(last["close"])}
+
+    return {"bullish_sweep": bullish_sweep, "bearish_sweep": bearish_sweep}
+
+
 def near_level(price: float, level: Optional[float], tolerance_atr: float, a: float) -> bool:
     if level is None or a <= 0:
         return False
@@ -844,6 +872,28 @@ def compute_sideways_lean(df: pd.DataFrame, htf_trend: RegimeType, lookback: int
             "structure": structure_component, "accumulation": accum_component}
 
 
+def find_recent_impulse(df: pd.DataFrame, direction: str, lookback: int = 30,
+                         vol_multiple: float = 1.3) -> Optional[float]:
+    """최근 lookback봉 안에서 direction 방향(up/down)으로 거래량 급증(vol_multiple배 이상)이
+    동반된 임펄스 캔들이 있었는지 확인. 있으면 그중 가장 강했던 거래량 배수를 반환, 없으면 None.
+
+    ⚠️ 예전엔 '가장 최근 봉' 하나만 보고 판단해서, 임펄스가 며칠 전에 있었고 지금 막 그
+    되돌림 구간(오더블록/EMA20)에 도달한 이상적인 순간에도, 되돌림 중엔 거래량이 보통
+    잠잠해지니까 신호가 사라지는 문제가 있었습니다. 이제는 최근 구간 전체를 훑어서
+    '그 임펄스가 최근에 있었다'는 사실 자체를 기억하고, 진입 여부는 별도로 가격이
+    되돌림 구간에 도달했는지(is_chase)로만 판단합니다."""
+    if len(df) < 25:
+        return None
+    window = df.tail(lookback + 20)
+    vol_avg20 = window["volume"].rolling(20).mean()
+    rel = (window["volume"] / vol_avg20).tail(lookback)
+    is_up = (window["close"] > window["open"]).tail(lookback)
+    is_down = (window["close"] < window["open"]).tail(lookback)
+    dirmask = is_up if direction == "up" else is_down
+    matched = rel[dirmask & (rel >= vol_multiple)]
+    return float(matched.max()) if not matched.empty else None
+
+
 def build_setup(symbol: str, exchange_id: str, df: pd.DataFrame, btc_df: pd.DataFrame,
                 regime: RegimeType, htf_trend: RegimeType = "sideways") -> Optional[CoinSetup]:
     """추격(chase) 대신 '되돌림 지정가 진입'을 기본으로 계산합니다.
@@ -857,19 +907,21 @@ def build_setup(symbol: str, exchange_id: str, df: pd.DataFrame, btc_df: pd.Data
     price = df["close"].iloc[-1]
     vol_avg20 = df["volume"].tail(20).mean()
     vol_now = df["volume"].iloc[-1]
-    rel_vol = vol_now / vol_avg20 if vol_avg20 else 1
+    rel_vol = vol_now / vol_avg20 if vol_avg20 else 1  # '지금 이 순간' 거래량 — 횡보 분기 전용
     rs = relative_strength_vs_btc(df, btc_df)
     ob = detect_order_block(df)
     a = atr(df)
     ema20 = ema(df["close"], 20).iloc[-1]
     vp = calculate_volume_profile(df)
+    sweep = detect_liquidity_sweep(df)
     cap = calculate_capture_ratios(df, btc_df)
 
     swing_high = df["high"].tail(20).max()
     swing_low = df["low"].tail(20).min()
 
     if regime == "uptrend":
-        if rel_vol < 1.3:  # 상승국면은 임펄스(거래량 급증) 확인이 전제조건
+        impulse_vol = find_recent_impulse(df, "up")  # 최근 30봉 안 임펄스 기억 (현재 봉 거래량과 무관)
+        if impulse_vol is None:
             return None
         if rs <= 0:
             return None
@@ -887,13 +939,14 @@ def build_setup(symbol: str, exchange_id: str, df: pd.DataFrame, btc_df: pd.Data
         conf_tag = " + POC/매물대 지지 겹침(컨플루언스)" if poc_conf else ""
         asym = cap["asymmetry"]
         asym_tag = f", 비대칭점수 {asym:+.2f}(상승↑{cap['up_capture']:.2f}/하락↓{cap['down_capture']:.2f})" if asym is not None else ""
-        note = (f"상대강도 {rs:.1f}%, 거래량 {rel_vol:.1f}배 임펄스 확인{conf_tag}{asym_tag} → "
+        note = (f"상대강도 {rs:.1f}%, 최근 임펄스(최대 거래량 {impulse_vol:.1f}배) 확인{conf_tag}{asym_tag} → "
                 f"{'⚠️추격 주의: 되돌림 대기' if is_chase else '되돌림 진입가 도달'}")
         return CoinSetup(symbol, exchange_id, "long", note,
                           pullback_entry, price, tp1, tp2, sl, rr, is_chase, poc_conf, rs, asym)
 
     if regime == "downtrend":
-        if rel_vol < 1.3:  # 하락국면은 임펄스(거래량 급증) 확인이 전제조건
+        impulse_vol = find_recent_impulse(df, "down")  # 최근 30봉 안 임펄스 기억 (현재 봉 거래량과 무관)
+        if impulse_vol is None:
             return None
         if rs >= 0:
             return None
@@ -908,7 +961,7 @@ def build_setup(symbol: str, exchange_id: str, df: pd.DataFrame, btc_df: pd.Data
         conf_tag = " + POC/매물대 저항 겹침(컨플루언스)" if poc_conf else ""
         asym = cap["asymmetry"]
         asym_tag = f", 비대칭점수 {asym:+.2f}(상승↑{cap['up_capture']:.2f}/하락↓{cap['down_capture']:.2f})" if asym is not None else ""
-        note = (f"상대강도 {rs:.1f}%, 거래량 {rel_vol:.1f}배 임펄스 확인{conf_tag}{asym_tag} → "
+        note = (f"상대강도 {rs:.1f}%, 최근 임펄스(최대 거래량 {impulse_vol:.1f}배) 확인{conf_tag}{asym_tag} → "
                 f"{'⚠️추격 주의: 반등 대기' if is_chase else '반등 진입가 도달'}")
         return CoinSetup(symbol, exchange_id, "short", note,
                           pullback_entry, price, tp1, tp2, sl, rr, is_chase, poc_conf, rs, asym)
@@ -1030,7 +1083,12 @@ def build_universe() -> Dict[str, str]:
     return universe
 
 
-def screen_market(regime: RegimeType, progress_cb=None) -> List[CoinSetup]:
+def screen_market(market_regime: RegimeType, progress_cb=None) -> List[CoinSetup]:
+    """market_regime은 BTC 기준 '시장 전체' 국면입니다. 각 코인의 롱/숏 분기는 그 코인
+    자신의 차트로 계산한 '개별 국면'을 따로 써서, 시장 전체가 상승이어도 개별적으로
+    뚜렷하게 하락 중인 코인은 숏 후보로, 그 반대도 마찬가지로 잡힐 수 있게 합니다.
+    시장 전체 국면과 다른 방향이면 counter_trend=True로 표시만 하고 걸러내지는 않습니다
+    (거시 흐름에 맞춰 타지 말지는 화면에서 사용자가 보고 판단)."""
     btc_df = fetch_btc_df()
     universe = build_universe()
     perps = bitget_perp_symbols() if BITGET_ONLY else set()
@@ -1051,11 +1109,14 @@ def screen_market(regime: RegimeType, progress_cb=None) -> List[CoinSetup]:
             df = fetch_ohlcv(exchange_id, symbol)
             if df is None:
                 continue
+            coin_regime = classify_price_trend(df)  # 이 코인 자신의 4h 차트 기준 개별 국면
             # 일봉(HTF)은 횡보 기울기 계산에만 먼저 필요 — 그 외 국면은 신호가 난 뒤에만 조회(API 절약)
-            htf_trend = get_htf_trend(exchange_id, symbol) if regime == "sideways" else None
-            setup = build_setup(symbol, exchange_id, df, btc_df, regime, htf_trend or "sideways")
+            htf_trend = get_htf_trend(exchange_id, symbol) if coin_regime == "sideways" else None
+            setup = build_setup(symbol, exchange_id, df, btc_df, coin_regime, htf_trend or "sideways")
             if not setup:
                 continue
+            if coin_regime in ("uptrend", "downtrend") and coin_regime != market_regime:
+                setup.counter_trend = True
 
             if setup.bias in ("long", "short"):
                 if htf_trend is None:
@@ -1094,7 +1155,7 @@ def run_analysis(risk_cfg: Optional[RiskConfig] = None, progress_cb=None) -> Dic
     """전체 파이프라인(국면 판단 → 스캔 → 상관 제한)을 실행하고 결과를 dict로 반환.
     (웹 화면(app.py)이 사용. main()은 같은 내용을 콘솔에 출력하는 버전)"""
     if risk_cfg is None:
-        risk_cfg = RiskConfig(account_balance=1000, risk_per_trade_pct=1.0, max_concurrent_setups=3)
+        risk_cfg = RiskConfig(account_balance=1000, risk_per_trade_pct=1.0, max_concurrent_setups=10)
     regime = determine_overall_regime()
     breaker = circuit_breaker_triggered(risk_cfg)
     all_setups: List[CoinSetup] = []
@@ -1219,7 +1280,9 @@ def simulate_strategy_history(df: pd.DataFrame, btc_df: pd.DataFrame, daily_df: 
         lo = max(0, i + 1 - OHLCV_LIMIT)  # 라이브(fetch_ohlcv limit=200)와 동일한 윈도우
         window_df = df.iloc[lo:i + 1]
         window_btc = btc_df.iloc[lo:i + 1]
-        regime_i = classify_price_trend(window_btc)
+        # 라이브(screen_market)와 동일하게: 분기 선택은 코인 자신의 국면 기준
+        # (예전엔 window_btc로 판단해서, 코인이 BTC와 반대로 가는 구간의 반대방향 셋업을 놓쳤음)
+        regime_i = classify_price_trend(window_df)
         htf_i = htf_trend_at(daily_df, row["ts"])  # 횡보 기울기 계산에도 쓰이므로 build_setup 호출 전에 계산
         setup = build_setup(f"bt_{i}", "backtest", window_df, window_btc, regime_i, htf_i)
 
@@ -1292,7 +1355,7 @@ def evaluate_lean_predictions(df: pd.DataFrame, btc_df: pd.DataFrame, daily_df: 
                                min_lookback: int = 80, threshold: float = 0.3,
                                cost_pct: float = 0.16,
                                ctx: Optional[Dict] = None) -> List[Dict]:
-    """BTC 기준 국면이 '횡보'인 시점마다 lean 점수를 계산하고, 강한 기울기(|score|>threshold)가
+    """이 코인 자신의 국면이 '횡보'인 시점마다 lean 점수를 계산하고, 강한 기울기(|score|>threshold)가
     나온 경우 이후 forward_bars봉 뒤 실제 수익률과 비교합니다.
     - 겹치는 표본으로 적중률이 부풀려지지 않도록 forward_bars 간격으로만 샘플링
     - hit = 방향 적중(부호), net_ret_pct = 왕복 비용(cost_pct, 수수료+슬리피지 근사) 차감 후 수익률
@@ -1303,9 +1366,10 @@ def evaluate_lean_predictions(df: pd.DataFrame, btc_df: pd.DataFrame, daily_df: 
     while i + forward_bars < len(df):
         key = df["ts"].iloc[i]
         if key not in ctx:
-            # 라이브와 동일하게 최근 OHLCV_LIMIT봉만으로 국면 판단 (속도 + 라이브 일관성)
-            window_btc = btc_df.iloc[max(0, i + 1 - OHLCV_LIMIT):i + 1]
-            regime_i = classify_price_trend(window_btc)
+            # 라이브(screen_market)·백테스트와 동일하게: 이 코인 자신의 국면 기준으로 판단
+            # (BTC 국면으로 판단하면 실제 신호 생성 로직과 다른 걸 검증하게 됨)
+            window_df = df.iloc[max(0, i + 1 - OHLCV_LIMIT):i + 1]
+            regime_i = classify_price_trend(window_df)
             htf_i = htf_trend_at(daily_df, key) if regime_i == "sideways" else None
             ctx[key] = (regime_i, htf_i)
         regime_i, htf_i = ctx[key]
@@ -1535,7 +1599,7 @@ def main(risk_cfg: Optional[RiskConfig] = None):
     if risk_cfg is None:
         # 기본값: 계좌 예시 1,000 USDT, 트레이드당 1% 리스크, 동일방향 최대 3개
         # 실전에서는 반드시 본인 실제 잔고로 바꿔서 호출하세요: main(RiskConfig(account_balance=..., ...))
-        risk_cfg = RiskConfig(account_balance=1000, risk_per_trade_pct=1.0, max_concurrent_setups=3)
+        risk_cfg = RiskConfig(account_balance=1000, risk_per_trade_pct=1.0, max_concurrent_setups=10)
 
     # 서킷브레이커: 오늘/이번 주 실현 손실이 한도를 넘었으면 신규 신호 자체를 생성하지 않음
     breaker_msg = circuit_breaker_triggered(risk_cfg)

@@ -16,7 +16,7 @@ import streamlit as st
 import app_logic as L
 import crypto_market_regime as cmr
 
-st.set_page_config(page_title="심신안정", page_icon="📈", layout="centered",
+st.set_page_config(page_title="코인 추천", page_icon="📈", layout="centered",
                    initial_sidebar_state="collapsed")
 st.markdown(f"<style>{L.CSS}</style>", unsafe_allow_html=True)
 
@@ -29,7 +29,7 @@ def get_store() -> dict:
 
 store = get_store()
 
-st.title("📈 심신안정")
+st.title("📈 코인 추천")
 st.caption("Bitget 선물용 · 4시간봉 스윙 신호 · 참고용(자동 주문 아님)")
 
 # ---------------------------------------------------------------- 설정
@@ -38,10 +38,10 @@ with st.expander("⚙️ 설정"):
     balance = c1.number_input("계좌 잔고 (USDT)", min_value=10.0, value=1000.0, step=100.0, key="balance")
     risk_pct = c2.number_input("트레이드당 리스크 (%)", min_value=0.1, max_value=3.0, value=1.0, step=0.1,
                                key="risk_pct", help="손절가에 닿았을 때 잃는 금액이 계좌의 몇 %인지")
-    max_n = st.slider("같은 방향 동시 추천 최대 개수", 1, 5, 3, key="max_n",
+    max_n = st.slider("같은 방향 동시 추천 최대 개수", 1, 15, 10, key="max_n",
                       help="알트코인은 BTC와 같이 움직여서, 같은 방향을 많이 잡아도 분산이 잘 안 됩니다")
     c3, c4 = st.columns(2)
-    top_n = c3.slider("거래소별 스캔 코인 수", 10, 60, 30, key="top_n", help="바꾼 뒤 '새로 분석'을 눌러야 반영")
+    top_n = c3.slider("거래소별 스캔 코인 수", 10, 150, 100, key="top_n", help="바꾼 뒤 '새로 분석'을 눌러야 반영")
     ttl_min = c4.selectbox("자동 갱신 주기(분)", [10, 15, 30, 60], index=1, key="ttl_min")
     bitget_only = st.checkbox("Bitget 선물 거래 가능한 코인만", value=True, key="bitget_only")
 
